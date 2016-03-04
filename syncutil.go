@@ -14,8 +14,8 @@ import (
 	"golang.org/x/net/context"
 )
 
-// OnceOK is an object that will perform exactly one successful action.
-type OnceOK struct {
+// Init is an object that will perform exactly one successful action.
+type Init struct {
 	once sync.Once
 	done chan struct{}
 	opc  chan op
@@ -38,28 +38,28 @@ type op struct {
 //
 // The function fn runs in its own goroutine and may complete in the
 // background after Do returns. Panics in fn are not recovered.
-func (o *OnceOK) Do(ctx context.Context, fn func() (interface{}, error)) (interface{}, error) {
+func (i *Init) Do(ctx context.Context, fn func() (interface{}, error)) (interface{}, error) {
 	select {
-	case <-o.done: // fast path
-		return o.val, nil
+	case <-i.done: // fast path
+		return i.val, nil
 	default:
 	}
 
-	o.once.Do(o.lazyInit)
+	i.once.Do(i.lazyInit)
 	errc := make(chan error)
 	// register op
 	select {
-	case <-o.done:
-		return o.val, nil
+	case <-i.done:
+		return i.val, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case o.opc <- op{true, errc, fn}:
+	case i.opc <- op{true, errc, fn}:
 		// registered
 	}
 	// await result
 	select {
-	case <-o.done:
-		return o.val, nil
+	case <-i.done:
+		return i.val, nil
 	case err := <-errc:
 		return nil, err
 	case <-ctx.Done():
@@ -67,23 +67,23 @@ func (o *OnceOK) Do(ctx context.Context, fn func() (interface{}, error)) (interf
 	}
 	// unregister op
 	select {
-	case <-o.done:
-		return o.val, nil
+	case <-i.done:
+		return i.val, nil
 	case err := <-errc:
 		return nil, err
-	case o.opc <- op{false, errc, fn}:
+	case i.opc <- op{false, errc, fn}:
 		return nil, ctx.Err()
 	}
 }
 
-func (o *OnceOK) lazyInit() {
-	o.done = make(chan struct{})
-	o.opc = make(chan op)
-	go o.loop()
+func (i *Init) lazyInit() {
+	i.done = make(chan struct{})
+	i.opc = make(chan op)
+	go i.loop()
 }
 
 // loop runs in its own goroutine
-func (o *OnceOK) loop() {
+func (i *Init) loop() {
 	pend := make(map[chan error]struct{})
 	errc := make(chan error)
 	busy := false
@@ -98,22 +98,22 @@ func (o *OnceOK) loop() {
 				}
 				continue
 			}
-			close(o.done) // succeeded
+			close(i.done) // succeeded
 			return
-		case opv := <-o.opc:
-			if !opv.join { // remove pending
-				delete(pend, opv.errc)
+		case o := <-i.opc:
+			if !o.join { // remove pending
+				delete(pend, o.errc)
 				continue
 			}
 			if !busy { // fresh op
 				busy = true
 				go func() {
 					var err error
-					o.val, err = opv.fn()
+					i.val, err = o.fn()
 					errc <- err
 				}()
 			}
-			pend[opv.errc] = struct{}{}
+			pend[o.errc] = struct{}{}
 		}
 	}
 }

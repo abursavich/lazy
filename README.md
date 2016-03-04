@@ -7,17 +7,17 @@ those provided by the standard library's sync package.
 
 Values containing the types defined in this package should not be copied.
 
-## type OnceOK
+## type Init
 ``` go
-type OnceOK struct {
+type Init struct {
     // contains filtered or unexported fields
 }
 ```
-OnceOK is an object that will perform exactly one successful action.
+Init is an object that will perform exactly one successful action.
 
-### func (\*OnceOK) Do
+### func (\*Init) Do
 ``` go
-func (o *OnceOK) Do(ctx context.Context, fn func() (interface{}, error)) (interface{}, error)
+func (i *Init) Do(ctx context.Context, fn func() (interface{}, error)) (interface{}, error)
 ```
 Do de-duplicates concurrent calls to the function fn and memoizes the
 first result for which a nil error is returned. Calls to Do may return
