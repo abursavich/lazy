@@ -10,22 +10,25 @@ package syncutil
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/net/context"
 )
 
+const (
+	uninitialized = iota
+	initialized
+	finished
+)
+
 // Init is an object that will perform exactly one successful action.
 type Init struct {
-	once sync.Once
-	done chan struct{}
-	opc  chan op
-	val  interface{}
-}
-
-type op struct {
-	join bool
-	errc chan error
-	fn   func() (interface{}, error)
+	mu    sync.Mutex
+	state uint32
+	done  chan struct{}
+	wake  chan struct{}
+	errc  chan chan error
+	val   interface{}
 }
 
 // Do de-duplicates concurrent calls to the function fn and memoizes the
@@ -39,21 +42,30 @@ type op struct {
 // The function fn runs in its own goroutine and may complete in the
 // background after Do returns. Panics in fn are not recovered.
 func (i *Init) Do(ctx context.Context, fn func() (interface{}, error)) (interface{}, error) {
-	select {
-	case <-i.done: // fast path
+	if s := atomic.LoadUint32(&i.state); s == finished { // fast path
 		return i.val, nil
-	default:
+	} else if s == uninitialized { // lazy initialization
+		i.mu.Lock()
+		if i.state == uninitialized {
+			i.done = make(chan struct{})
+			i.wake = make(chan struct{}, 1)
+			i.errc = make(chan chan error)
+			i.wake <- struct{}{}
+			atomic.StoreUint32(&i.state, initialized)
+		}
+		i.mu.Unlock()
 	}
 
-	i.once.Do(i.lazyInit)
 	errc := make(chan error)
-	// register op
+	// register
 	select {
 	case <-i.done:
 		return i.val, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case i.opc <- op{true, errc, fn}:
+	case <-i.wake:
+		go i.run(errc, fn)
+	case i.errc <- errc:
 		// registered
 	}
 	// await result
@@ -65,55 +77,48 @@ func (i *Init) Do(ctx context.Context, fn func() (interface{}, error)) (interfac
 	case <-ctx.Done():
 		// quiting
 	}
-	// unregister op
+	// unregister
 	select {
 	case <-i.done:
 		return i.val, nil
 	case err := <-errc:
 		return nil, err
-	case i.opc <- op{false, errc, fn}:
+	case i.errc <- errc:
 		return nil, ctx.Err()
 	}
 }
 
-func (i *Init) lazyInit() {
-	i.done = make(chan struct{})
-	i.opc = make(chan op)
-	go i.loop()
-}
+// run lazily runs in its own goroutine on demand
+func (i *Init) run(errc chan error, fn func() (interface{}, error)) {
+	c := make(chan error)
+	go func() {
+		var err error
+		i.val, err = fn()
+		c <- err
+	}()
 
-// loop runs in its own goroutine
-func (i *Init) loop() {
-	pend := make(map[chan error]struct{})
-	errc := make(chan error)
-	busy := false
+	m := map[chan error]struct{}{
+		errc: struct{}{}, // runner starts registered
+	}
 	for {
 		select {
-		case err := <-errc: // completed
-			if err != nil { // failed
-				busy = false
-				for c := range pend {
-					delete(pend, c)
-					c <- err
-				}
-				continue
-			}
-			close(i.done) // succeeded
-			return
-		case o := <-i.opc:
-			if !o.join { // remove pending
-				delete(pend, o.errc)
-				continue
-			}
-			if !busy { // fresh op
-				busy = true
-				go func() {
-					var err error
-					i.val, err = o.fn()
+		case err := <-c:
+			if err != nil {
+				for errc := range m { // broadcast error
 					errc <- err
-				}()
+				}
+				i.wake <- struct{}{} // signal next runner
+				return
 			}
-			pend[o.errc] = struct{}{}
+			atomic.StoreUint32(&i.state, finished)
+			close(i.done)
+			return
+		case errc := <-i.errc:
+			if _, ok := m[errc]; ok { // unregister
+				delete(m, errc)
+				continue
+			}
+			m[errc] = struct{}{} // register
 		}
 	}
 }
